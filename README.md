@@ -140,8 +140,9 @@ All Earth data accessed via [NASA Earthdata](https://search.earthdata.nasa.gov) 
 ## Team 6/8
 
 | Member | Role |
-|Milan Thiele|Coding the Scoring Algorithm|
-| Luis Rennert | Coding the Data Preparation|
-|Aniko Hiemisch|Research|
-| Helge Dix | Research |
-|Richard Wettstein|Advanced Visual Automation & Data Storytelling|
+|---|---|
+| Milan Thiele | Coding the scoring algorithm |
+| Luis Rennert | Coding the data preparation |
+| Aniko Hiemisch | Research of relevant parameters|
+| Helge Dix | Research known Moon Locations|
+| Richard Wettstein | Advanced visual automation & data storytelling |
