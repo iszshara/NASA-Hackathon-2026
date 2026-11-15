@@ -1,0 +1,10 @@
+{
+  "ndvi_max": 0.0,
+  "rain_mm_year": 0.0,
+  "albedo": 0.07,
+  "lst_max": 117,
+  "lst_min": -178,
+  "lst_diff": 295,
+  "lst_min_polar_shadow": -233,
+  "sources": "Diviner/LRO (Williams et al. 2017, Icarus 283); Albedo Mare ca. 0.07"
+}

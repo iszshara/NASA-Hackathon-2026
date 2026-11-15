@@ -1,5 +1,9 @@
 __pycache__/
 *.pyc
-data/
+data/*
 .DS_Store
 .venv/
+!data/features.nc
+!data/features.csv
+!data/moon_reference.json
+!data/known_analogs.csv
