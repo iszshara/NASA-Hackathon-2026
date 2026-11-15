@@ -1,251 +1,190 @@
 """
-score.py - Analog-Score (0.0 bis 1.0) für Mars-/Mond-ähnliche Orte auf der Erde.
+score.py - Analog score (0.0 to 1.0) for Moon-like places on Earth.
 
-Idee:
-  1. Für jedes Merkmal (Trockenheit, Vegetation, ...) wird der Erdwert mit dem
-     Zielwert des Planeten verglichen  ->  Teilscore zwischen 0 und 1.
-  2. Alle Teilscores werden gewichtet zu einem Lokalscore zusammengefasst.
+Idea:
+  1. For each feature (vegetation, rain, albedo, ...) the Earth value is
+     compared with the target planet  ->  sub-score between 0 and 1.
+  2. All sub-scores are combined into one weighted local score.
 
-Alle Funktionen arbeiten mit numpy. Dadurch funktionieren sie nicht nur mit
-einzelnen Zahlen, sondern auch direkt mit ganzen 2D-Rastern (lat x lon) –
-genau das, was ihr später für die Heatmap braucht. Keine for-Schleife über
-Pixel nötig.
+All functions use numpy, so they work with single numbers as well as with
+whole 2D grids (lat x lon) - e.g. the arrays in data/features.nc.
 
-Fehlende Daten werden als NaN (np.nan) übergeben und beim Gesamtscore
-automatisch ignoriert (die übrigen Gewichte werden hochskaliert).
+Missing data is passed as NaN. It is ignored when combining the scores, but
+lowers the "coverage", which in turn lowers the final score.
+
+Feature names match the columns produced by data_prep/build.py:
+    ndvi_max, lst_diff, lst_max, lst_min, albedo, rain_mm_year, basalt_index
 """
+
+import json
+from pathlib import Path
 
 import numpy as np
 
+DATA_DIR = Path(__file__).parent / "data"
+
 
 # ---------------------------------------------------------------------------
-# 1. Bausteine: so wird aus (Erdwert, Zielwert) ein Teilscore
+# 1. Building blocks: how (Earth value, target) becomes a sub-score
 # ---------------------------------------------------------------------------
 
-def score_gauss(wert, ziel, toleranz):
-    """Glockenkurve: 1.0 genau am Zielwert, fällt nach beiden Seiten ab.
+def score_gaussian(value, target, tolerance):
+    """Bell curve: 1.0 exactly at the target, falls off on both sides.
 
-    Für Merkmale, bei denen 'zu viel' und 'zu wenig' beides schlecht ist
-    (z. B. Hangneigung). Bei Abstand = 1x toleranz ist der Score ~0.61,
-    bei 2x toleranz ~0.14, bei 3x toleranz ~0.01.
+    At a distance of 1x tolerance the score is ~0.61, at 2x ~0.14, at 3x ~0.01.
     """
-    wert = np.asarray(wert, dtype=float)
-    return np.exp(-0.5 * ((wert - ziel) / toleranz) ** 2)
+    value = np.asarray(value, dtype=float)
+    return np.exp(-0.5 * ((value - target) / tolerance) ** 2)
 
 
-def score_weniger_ist_besser(wert, gut, schlecht):
-    """1.0 wenn wert <= gut, 0.0 wenn wert >= schlecht, linear dazwischen.
-
-    Für Merkmale, bei denen der Planet praktisch bei 'null' liegt
-    (z. B. Vegetation, Niederschlag, Abstand zum nächsten Krater).
-    """
-    wert = np.asarray(wert, dtype=float)
-    return np.clip((schlecht - wert) / (schlecht - gut), 0.0, 1.0)
+def score_lower_is_better(value, good, bad):
+    """1.0 if value <= good, 0.0 if value >= bad, linear in between."""
+    value = np.asarray(value, dtype=float)
+    return np.clip((bad - value) / (bad - good), 0.0, 1.0)
 
 
-def score_mehr_ist_besser(wert, schlecht, gut):
-    """0.0 wenn wert <= schlecht, 1.0 wenn wert >= gut, linear dazwischen."""
-    wert = np.asarray(wert, dtype=float)
-    return np.clip((wert - schlecht) / (gut - schlecht), 0.0, 1.0)
-
-
-def score_zusammensetzung(erde, ziel, toleranz):
-    """Vergleicht zwei Zusammensetzungen (z. B. Oxid-Anteile in %).
-
-    Berechnet den euklidischen Abstand der beiden Vektoren (in Prozentpunkten)
-    und steckt ihn in die Glockenkurve. Die letzte Achse von `erde` sind die
-    Bestandteile, d. h. für ein Raster hat `erde` die Form (lat, lon, n).
-    """
-    erde = np.asarray(erde, dtype=float)
-    ziel = np.asarray(ziel, dtype=float)
-    abstand = np.linalg.norm(erde - ziel, axis=-1)
-    return np.exp(-0.5 * (abstand / toleranz) ** 2)
+def score_higher_is_better(value, bad, good):
+    """0.0 if value <= bad, 1.0 if value >= good, linear in between."""
+    value = np.asarray(value, dtype=float)
+    return np.clip((value - bad) / (good - bad), 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
-# 2. Konfiguration: Zielwerte pro Planet
+# 2. Configuration: target values per planet
 # ---------------------------------------------------------------------------
-# !!! Alle Zahlen sind PLATZHALTER / grobe Richtwerte zum Testen. !!!
-# Bitte im Team mit echten Quellen (Paper, NASA-Datensätze) belegen.
+# Moon reference values come from data/moon_reference.json (Diviner/LRO).
 #
-# Reihenfolge der Bodenoxide: [SiO2, Al2O3, FeO, MgO, CaO, Rest]  (Gew.-%)
+# Many Moon values are far outside anything that exists on Earth
+# (e.g. a day/night temperature difference of ~295 K). A bell curve around
+# the Moon value would give ~0 everywhere. For those features the rule is
+# therefore "the closer to the Moon, the better", scaled to what Earth can
+# reach:  bad = Earth median (land),  good = ~99th percentile of Earth land
+# cells in the Moon direction (from features.nc, 2024).
 
-OXIDE = ["SiO2", "Al2O3", "FeO", "MgO", "CaO", "Rest"]
+with open(DATA_DIR / "moon_reference.json", encoding="utf-8") as f:
+    MOON_REF = json.load(f)
 
-ZIELE = {
-    "mars": {
-        # Aridity Index = Niederschlag / potenzielle Verdunstung (<0.05 = hyperarid)
-        "trockenheit": {"typ": "weniger", "gut": 0.03, "schlecht": 0.5, "gewicht": 2.0},
-        # NDVI (Vegetationsindex): < 0.1 = praktisch kahl
-        "vegetation":  {"typ": "weniger", "gut": 0.05, "schlecht": 0.3, "gewicht": 2.0},
-        # mittlere Einstrahlung in kWh/m²/Tag (Proxy: wenig Wolken, dünne Luft)
-        "sonne":       {"typ": "mehr", "schlecht": 3.0, "gut": 7.0, "gewicht": 0.5},
-        # mittlere Hangneigung in Grad
-        "hangneigung": {"typ": "gauss", "ziel": 5.0, "toleranz": 5.0, "gewicht": 1.0},
-        # Rauheit, z. B. Terrain Ruggedness Index (TRI) in Metern
-        "rauheit":     {"typ": "gauss", "ziel": 15.0, "toleranz": 15.0, "gewicht": 0.5},
-        # Abstand zur nächsten Impaktstruktur in km
-        "krater":      {"typ": "weniger", "gut": 0.0, "schlecht": 50.0, "gewicht": 1.0,
-                        "minimum": 0.4},
-        # Boden: basaltisch, eisenreich
-        "boden":       {"typ": "zusammensetzung",
-                        "ziel": [46, 10, 17, 8, 7, 12], "toleranz": 12.0, "gewicht": 1.5},
-    },
-    "mond": {
-        "trockenheit": {"typ": "weniger", "gut": 0.03, "schlecht": 0.5, "gewicht": 2.0},
-        "vegetation":  {"typ": "weniger", "gut": 0.05, "schlecht": 0.3, "gewicht": 2.0},
-        "sonne":       {"typ": "mehr", "schlecht": 3.0, "gut": 7.0, "gewicht": 0.5},
-        "hangneigung": {"typ": "gauss", "ziel": 8.0, "toleranz": 6.0, "gewicht": 1.0},
-        "rauheit":     {"typ": "gauss", "ziel": 20.0, "toleranz": 15.0, "gewicht": 0.5},
-        # Mond ist viel stärker verkratert -> Krater wichtiger
-        "krater":      {"typ": "weniger", "gut": 0.0, "schlecht": 50.0, "gewicht": 2.0,
-                        "minimum": 0.3},
-        # Boden: Hochland-Anorthosit, sehr Al- und Ca-reich
-        "boden":       {"typ": "zusammensetzung",
-                        "ziel": [45, 25, 6, 7, 15, 2], "toleranz": 12.0, "gewicht": 1.5},
+TARGETS = {
+    "moon": {
+        # max. NDVI of the year: Moon = 0 (no vegetation). < 0.1 = practically bare
+        "ndvi_max":     {"type": "lower", "good": 0.05, "bad": 0.3, "weight": 2.0},
+        # precipitation in mm/year: Moon = 0. Earth land median ~380
+        "rain_mm_year": {"type": "lower", "good": 25.0, "bad": 400.0, "weight": 2.0},
+        # shortwave albedo: Moon maria ~0.07 -> the darker the better, snow/ice (~0.8) = 0.
+        # (A bell curve around 0.07 was too strict: bright desert sand got ~0.)
+        "albedo":       {"type": "lower", "good": max(MOON_REF["albedo"], 0.10),
+                         "bad": 0.45, "weight": 1.5},
+        # mean day/night LST difference in K: Moon ~295. Earth median ~5, p99 ~20
+        "lst_diff":     {"type": "higher", "bad": 5.0, "good": 20.0, "weight": 1.0},
+        # annual span lst_max - lst_min in K (derived): Moon ~295. Earth median ~33, p99 ~64
+        "lst_span":     {"type": "higher", "bad": 33.0, "good": 60.0, "weight": 1.0},
+        # ASTER basalt index - enable as soon as aster_2024.nc is part of features.nc.
+        # Direction and thresholds still need to be checked with the data team.
+        # "basalt_index": {"type": "higher", "bad": ..., "good": ..., "weight": 1.5},
     },
 }
 
 
+def add_derived(values):
+    """Adds features that are computed from other features."""
+    values = dict(values)
+    if "lst_max" in values and "lst_min" in values:
+        values["lst_span"] = np.asarray(values["lst_max"], float) - np.asarray(values["lst_min"], float)
+    return values
+
+
 # ---------------------------------------------------------------------------
-# 3. Teilscore für ein Merkmal anhand der Konfiguration
+# 3. Sub-score for one feature based on the configuration
 # ---------------------------------------------------------------------------
 
-def teilscore(wert, regel):
-    """Wählt anhand von regel['typ'] die passende Bausteinfunktion.
+def sub_score(value, rule):
+    """Picks the matching building block based on rule['type'].
 
-    Optional regel['minimum']: Untergrenze für den Teilscore. Sinnvoll für
-    'Bonus-Merkmale' wie Krater, die auf der Erde fast nirgends vorkommen –
-    ihr Fehlen soll den Gesamtscore senken, aber nicht auf 0 drücken.
+    Optional rule['minimum']: lower bound for the sub-score (for 'bonus
+    features' whose absence should not push the score to 0).
     """
-    typ = regel["typ"]
-    if typ == "gauss":
-        s = score_gauss(wert, regel["ziel"], regel["toleranz"])
-    elif typ == "weniger":
-        s = score_weniger_ist_besser(wert, regel["gut"], regel["schlecht"])
-    elif typ == "mehr":
-        s = score_mehr_ist_besser(wert, regel["schlecht"], regel["gut"])
-    elif typ == "zusammensetzung":
-        s = score_zusammensetzung(wert, regel["ziel"], regel["toleranz"])
+    kind = rule["type"]
+    if kind == "gaussian":
+        s = score_gaussian(value, rule["target"], rule["tolerance"])
+    elif kind == "lower":
+        s = score_lower_is_better(value, rule["good"], rule["bad"])
+    elif kind == "higher":
+        s = score_higher_is_better(value, rule["bad"], rule["good"])
     else:
-        raise ValueError(f"Unbekannter Regel-Typ: {typ}")
-    # np.fmax statt np.maximum, damit NaN (fehlende Daten) NaN bleibt
-    return np.where(np.isnan(s), np.nan, np.fmax(s, regel.get("minimum", 0.0)))
+        raise ValueError(f"Unknown rule type: {kind}")
+    # np.fmax instead of np.maximum, so that NaN (missing data) stays NaN
+    return np.where(np.isnan(s), np.nan, np.fmax(s, rule.get("minimum", 0.0)))
 
 
 # ---------------------------------------------------------------------------
-# 4. Teilscores zum Lokalscore zusammensetzen
+# 4. Combining sub-scores into the local score
 # ---------------------------------------------------------------------------
 
-def gesamtscore(teilscores, gewichte, methode="geometrisch", abdeckung_strafe=1.0):
-    """Fasst Teilscores (dict name -> Wert/Array) gewichtet zusammen.
+def combine_scores(sub_scores, weights, method="geometric", coverage_penalty=1.0):
+    """Combines sub-scores (dict name -> value/array) with weights.
 
-    Rückgabe: (score, abdeckung)
-      abdeckung = Anteil der Gewichte, für die Daten vorhanden sind (0..1).
-      Der Score wird mit abdeckung ** abdeckung_strafe multipliziert, damit ein
-      Ort mit nur 2 bekannten Merkmalen nicht künstlich 1.0 erreicht.
-      abdeckung_strafe=0 schaltet die Strafe aus, 1 = linear, 2 = streng.
+    Returns: (score, coverage)
+      coverage = share of the weights for which data is available (0..1).
+      The score is multiplied by coverage ** coverage_penalty.
+      coverage_penalty=0 disables the penalty, 1 = linear, 2 = strict.
 
-    methode="arithmetisch": normaler gewichteter Mittelwert.
-        Ein grüner Regenwald mit Krater und Basalt kann trotzdem ~0.5 erreichen.
-    methode="geometrisch": gewichtetes geometrisches Mittel (empfohlen).
-        Ist EIN wichtiges Merkmal ~0, zieht es den ganzen Score Richtung 0.
-        Das passt besser zu 'ein Analog muss in allem halbwegs passen'.
-
-    NaN-Teilscores (fehlende Daten) werden ignoriert.
+    method="geometric" (recommended): if ONE important feature is ~0, the
+        whole score goes towards 0 ('an analog has to match in everything').
+    method="arithmetic": ordinary weighted mean.
     """
-    namen = list(teilscores)
-    # broadcast_arrays: ein komplett fehlendes Merkmal (einzelnes NaN) wird
-    # automatisch auf Rastergröße gebracht
-    arrays = np.broadcast_arrays(*[np.asarray(teilscores[n], dtype=float) for n in namen])
+    names = list(sub_scores)
+    arrays = np.broadcast_arrays(*[np.asarray(sub_scores[n], dtype=float) for n in names])
     s = np.stack(arrays)
-    w = np.array([gewichte[n] for n in namen], dtype=float)
-    w = w.reshape((-1,) + (1,) * (s.ndim - 1))      # Gewichte passend zum Raster formen
+    w = np.array([weights[n] for n in names], dtype=float)
+    w = w.reshape((-1,) + (1,) * (s.ndim - 1))
 
-    vorhanden = ~np.isnan(s)
-    w_eff = np.where(vorhanden, w, 0.0)              # fehlende Daten -> Gewicht 0
-    w_summe = w_eff.sum(axis=0)
-    abdeckung = w_summe / w.sum()
+    available = ~np.isnan(s)
+    w_eff = np.where(available, w, 0.0)              # missing data -> weight 0
+    w_sum = w_eff.sum(axis=0)
+    coverage = w_sum / w.sum()
 
     with np.errstate(invalid="ignore", divide="ignore"):
-        if methode == "arithmetisch":
-            ergebnis = np.nansum(w_eff * s, axis=0) / w_summe
-        elif methode == "geometrisch":
+        if method == "arithmetic":
+            result = np.nansum(w_eff * s, axis=0) / w_sum
+        elif method == "geometric":
             log_s = np.log(np.maximum(np.nan_to_num(s, nan=1.0), 1e-6))
-            ergebnis = np.exp((w_eff * log_s).sum(axis=0) / w_summe)
+            result = np.exp((w_eff * log_s).sum(axis=0) / w_sum)
         else:
-            raise ValueError(f"Unbekannte Methode: {methode}")
+            raise ValueError(f"Unknown method: {method}")
 
-    ergebnis = ergebnis * abdeckung ** abdeckung_strafe
-    ergebnis = np.where(w_summe > 0, ergebnis, np.nan)   # gar keine Daten -> NaN
-    return ergebnis, abdeckung
+    result = result * coverage ** coverage_penalty
+    result = np.where(w_sum > 0, result, np.nan)     # no data at all -> NaN
+    return result, coverage
 
 
-def lokalscore(erdwerte, planet="mars", methode="geometrisch", abdeckung_strafe=1.0):
-    """Hauptfunktion: Erdwerte (dict) -> (Lokalscore, Teilscores, Abdeckung).
+def local_score(earth_values, planet="moon", method="geometric",
+                coverage_penalty=1.0, min_coverage=0.0):
+    """Main function: Earth values (dict) -> (local score, sub-scores, coverage).
 
-    Merkmale, die in `erdwerte` fehlen, zählen als fehlende Daten (NaN)
-    und senken über die Abdeckung den Score.
+    min_coverage: cells with less coverage get NaN instead of a score
+    (e.g. 0.5 removes ocean cells that only have rain data).
     """
-    regeln = ZIELE[planet]
-    teile = {name: teilscore(erdwerte.get(name, np.nan), regel)
-             for name, regel in regeln.items()}
-    gewichte = {name: regel["gewicht"] for name, regel in regeln.items()}
-    score, abdeckung = gesamtscore(teile, gewichte, methode, abdeckung_strafe)
-    return score, teile, abdeckung
+    values = add_derived(earth_values)
+    rules = TARGETS[planet]
+    parts = {name: sub_score(values.get(name, np.nan), rule) for name, rule in rules.items()}
+    weights = {name: rule["weight"] for name, rule in rules.items()}
+    score, coverage = combine_scores(parts, weights, method, coverage_penalty)
+    score = np.where(coverage >= min_coverage, score, np.nan)
+    return score, parts, coverage
 
 
-# ---------------------------------------------------------------------------
-# 5. Kleiner Test mit Beispielorten
-# ---------------------------------------------------------------------------
-# Die Werte sind GESCHÄTZTE Beispielwerte zum Testen der Logik, keine Messdaten.
+def score_dataset(ds, planet="moon", **options):
+    """Scores a whole xarray Dataset (e.g. features.nc).
 
-BEISPIELE = {
-    "Atacama (Chile)": {
-        "trockenheit": 0.01, "vegetation": 0.05, "sonne": 7.5,
-        "hangneigung": 4.0, "rauheit": 12.0, "krater": 300.0,
-        "boden": [60, 15, 6, 3, 5, 11],
-    },
-    "Lavafeld (Island)": {
-        "trockenheit": 1.2, "vegetation": 0.15, "sonne": 2.5,
-        "hangneigung": 6.0, "rauheit": 25.0, "krater": 2000.0,
-        "boden": [49, 15, 11, 7, 10, 8],
-    },
-    "Meteor Crater (Arizona)": {
-        "trockenheit": 0.15, "vegetation": 0.12, "sonne": 6.0,
-        "hangneigung": 7.0, "rauheit": 20.0, "krater": 0.0,
-        "boden": [65, 10, 3, 2, 8, 12],
-    },
-    "Amazonas (Brasilien)": {
-        "trockenheit": 1.8, "vegetation": 0.85, "sonne": 4.5,
-        "hangneigung": 2.0, "rauheit": 5.0, "krater": 800.0,
-        "boden": [55, 25, 8, 1, 1, 10],
-    },
-    "Ort mit fehlenden Daten": {
-        "trockenheit": 0.02, "vegetation": np.nan, "sonne": 7.0,
-    },
-}
-
-
-if __name__ == "__main__":
-    for planet in ("mars", "mond"):
-        print(f"\n===== Zielplanet: {planet.upper()} =====")
-        for ort, werte in BEISPIELE.items():
-            geo, teile, abd = lokalscore(werte, planet, "geometrisch")
-            ari, _, _ = lokalscore(werte, planet, "arithmetisch")
-            details = "  ".join(f"{k}={float(v):.2f}" for k, v in teile.items())
-            print(f"{ort:26s} geo={float(geo):.2f}  arith={float(ari):.2f}  "
-                  f"abdeckung={float(abd):.2f}   | {details}")
-
-    # Raster-Test: dieselben Funktionen auf einem 3x4-Gitter (wie später die Heatmap)
-    rng = np.random.default_rng(0)
-    raster = {
-        "trockenheit": rng.uniform(0, 1, (3, 4)),
-        "vegetation":  rng.uniform(0, 0.8, (3, 4)),
-        "boden":       rng.uniform(0, 30, (3, 4, len(OXIDE))),
-    }
-    # ein Pixel ohne Vegetationsdaten, um die Abdeckung im Raster zu prüfen
-    raster["vegetation"][0, 1] = np.nan
-    karte, _, abdeckung = lokalscore(raster, "mars", abdeckung_strafe=0)
-    print("\nRaster-Test ohne Strafe (Form", karte.shape, "):\n", np.round(karte, 2))
-    print("Abdeckung pro Pixel:\n", np.round(abdeckung, 2))
+    Returns a new Dataset with 'score', 'coverage' and one 'part_<feature>'
+    variable per sub-score, on the same lat/lon grid.
+    """
+    import xarray as xr
+    values = {name: ds[name].values for name in ds.data_vars}
+    score, parts, coverage = local_score(values, planet, **options)
+    dims, coords = ds[list(ds.data_vars)[0]].dims, ds.coords
+    out = xr.Dataset({"score": (dims, score), "coverage": (dims, coverage)}, coords=coords)
+    for name, part in parts.items():
+        out[f"part_{name}"] = (dims, np.broadcast_to(part, score.shape))
+    out.attrs["planet"] = planet
+    return out

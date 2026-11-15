@@ -1,0 +1,12 @@
+# scoring + map (enough to reproduce the results from data/features.nc)
+numpy
+pandas
+xarray
+netCDF4
+matplotlib
+
+# only needed to rebuild data/features.nc from the raw NASA files (data_prep/, download.py)
+earthaccess
+pyhdf
+h5py
+h5netcdf

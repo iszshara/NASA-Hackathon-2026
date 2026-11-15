@@ -34,6 +34,12 @@ def build_features():
         parts.append(to_grid(ds.load()))
         print(f"geladen: {name} -> {list(ds.data_vars)}")
 
+    # ohne Eingabedateien abbrechen, sonst wird features.nc leer ueberschrieben
+    if not parts:
+        print("Keine Zwischendateien gefunden -> features.nc/features.csv bleiben unveraendert.")
+        print("Erst download.py und die prepare_*.py-Skripte ausfuehren.")
+        return
+
     features = xr.merge(parts)
     features.attrs["description"] = "Rohwerte pro 0,5-Grad-Zelle fuer das Mond-Scoring"
     features.to_netcdf(DATA_DIR / "features.nc")

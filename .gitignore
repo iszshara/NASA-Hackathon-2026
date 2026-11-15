@@ -7,3 +7,4 @@ data/*
 !data/features.csv
 !data/moon_reference.json
 !data/known_analogs.csv
+.idea/
